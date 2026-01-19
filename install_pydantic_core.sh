@@ -58,7 +58,6 @@ esac
 echo -e "   - Arch: ${GREEN}${ARCH}${NC} (${PLAT_TAG})"
 
 # 3. Version Resolution
-# We query the GitHub API to list folders inside python/{version}/pydantic-core/
 echo -e "${YELLOW}[3/4] Resolving latest version...${NC}"
 
 API_URL="https://api.github.com/repos/${REPO_USER}/${REPO_NAME}/contents/python/${PY_VER_DOT}/pydantic-core?ref=${BRANCH}"
@@ -69,7 +68,6 @@ PKG_VER=$(curl -s "$API_URL" | grep '"name":' | cut -d'"' -f4 | sort -V | tail -
 if [ -z "$PKG_VER" ] || [ "$PKG_VER" == "null" ]; then
   echo -e "${RED}Error: Could not find any compatible wheels in the repository.${NC}"
   echo "   Checked path: python/${PY_VER_DOT}/pydantic-core/"
-  echo "   API Response: $(curl -s "$API_URL" | head -n 1)"
   exit 1
 fi
 
@@ -85,18 +83,18 @@ FULL_URL="https://raw.githubusercontent.com/${REPO_USER}/${REPO_NAME}/${BRANCH}/
 
 echo -e "   - Source: ${CYAN}${WHEEL_NAME}${NC}"
 
-TMP_WHL="pydantic_core_opt.whl"
-
-if curl -fL -o "$TMP_WHL" "$FULL_URL" --progress-bar; then
+# FIX: We must save the file with the REAL name, otherwise pip rejects it.
+if curl -fL -o "$WHEEL_NAME" "$FULL_URL" --progress-bar; then
   echo ""
-  pip install "./$TMP_WHL"
-  rm -f "$TMP_WHL"
+  echo -e "${YELLOW}Installing wheel...${NC}"
+  pip install "./$WHEEL_NAME"
+  rm -f "$WHEEL_NAME"
   echo ""
   echo -e "${GREEN}✅ Success! pydantic-core ${PKG_VER} installed.${NC}"
 else
   echo ""
   echo -e "${RED}❌ Download failed.${NC}"
   echo "   URL: $FULL_URL"
-  rm -f "$TMP_WHL"
+  rm -f "$WHEEL_NAME"
   exit 1
 fi
