@@ -68,10 +68,8 @@ jobs:
           PKG_VER="${{ needs.check-version.outputs.version }}"
           ARCH="${{ matrix.arch }}"
           
-          # Required by Maturin
           export ANDROID_API_LEVEL=${{ env.ANDROID_API }}
           
-          # Set NDK Paths
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
           export PATH="$NDK_BIN:$PATH"
@@ -100,8 +98,7 @@ jobs:
           fi
           
           CLANG_WRAPPER="${CC_TARGET}-clang"
-
-          # Configure Linker
+          
           LINKER_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
           if [ -f "$NDK_BIN/$CLANG_WRAPPER" ]; then
              export $LINKER_VAR="$NDK_BIN/$CLANG_WRAPPER"
@@ -114,18 +111,15 @@ jobs:
           mkdir -p "$MOCK_DIR"
 
           echo "🔨 Generating fake libpython with SONAME..."
-          # CRITICAL FIX: We must set SONAME so the final binary knows it depends on libpython3.x.so
           "$NDK_BIN/clang" --target=$CC_TARGET \
               -shared \
               -Wl,-soname,libpython$PY_VER.so \
               -o "$MOCK_DIR/libpython$PY_VER.so" \
               -xc /dev/null
 
-          # Copy real libdl.so from NDK sysroot
           LIBDL_PATH=$(find "$NDK_SYSROOT" -name "libdl.so" | grep "$NDK_LIB_ARCH" | head -n 1)
           cp "$LIBDL_PATH" "$MOCK_DIR/"
           
-          # Create sysconfigdata to trick PyO3
           cat > "$MOCK_DIR/_sysconfigdata__linux_${RUST_TARGET}.py" <<EOF
           build_time_vars = {
               'SO': '.so', 'SOABI': 'cpython-$PY_VER', 'EXT_SUFFIX': '.so',
@@ -141,8 +135,6 @@ jobs:
           export PYO3_CROSS_PYTHON_VERSION="$PY_VER"
           export LIBRARY_PATH="$MOCK_DIR:$LIBRARY_PATH"
 
-          # Configure Rust Flags
-          # We explicitly link against our fake python lib
           RUSTFLAGS_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_RUSTFLAGS"
           export $RUSTFLAGS_VAR="-L native=$MOCK_DIR -lpython$PY_VER -C link-arg=--target=$CC_TARGET -C link-arg=-Wl,--unresolved-symbols=ignore-all"
 
@@ -157,7 +149,6 @@ jobs:
           # --- Rename Output ---
           cd target/wheels
           OLD=$(ls *.whl)
-          # Rename platform tag to 'linux' for pip compatibility on Termux
           NEW=$(echo "$OLD" | sed -E "s/(-[^-]+)\.whl$/-${PLAT_TAG}.whl/")
           mv "$OLD" "$NEW"
           
@@ -198,7 +189,6 @@ jobs:
           for wheel in temp_wheels/*.whl; do
             filename=$(basename "$wheel")
             
-            # Extract python version (cp310 -> 3.10)
             py_tag=$(echo "$filename" | grep -oP 'cp\d+' | head -n1)
             py_num=${py_tag#cp}
             
@@ -209,6 +199,7 @@ jobs:
             fi
             
             TARGET_DIR="python/$py_folder/$PKG_NAME/$PKG_VER"
+            
             mkdir -p "$TARGET_DIR"
             mv "$wheel" "$TARGET_DIR/"
             echo "Moved $filename -> $TARGET_DIR/"
@@ -222,7 +213,10 @@ jobs:
           commit-message: "feat: Add wheels for ${{ env.PACKAGE_NAME }} v${{ needs.check-version.outputs.version }}"
           committer: GitHub <noreply@github.com>
           author: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>
-          branch: "add-wheels-${{ needs.check-version.outputs.version }}"
+          
+          # Fix: Unique branch name to avoid conflict with closed PRs
+          branch: "add-wheels-${{ needs.check-version.outputs.version }}-${{ github.run_id }}"
+          
           delete-branch: true
           title: "feat: Add ${{ env.PACKAGE_NAME }} ${{ needs.check-version.outputs.version }}"
           body: |
@@ -235,3 +229,4 @@ jobs:
             - Added pre-compiled wheels for Android (Termux).
             - Architectures: `arm64`, `armv7`, `x86`, `x86_64`
             - Python Versions: 3.9 - 3.13
+            - **Fix:** SONAME added to ensure dynamic linking works properly.
