@@ -68,8 +68,10 @@ jobs:
           PKG_VER="${{ needs.check-version.outputs.version }}"
           ARCH="${{ matrix.arch }}"
           
+          # Required by Maturin
           export ANDROID_API_LEVEL=${{ env.ANDROID_API }}
           
+          # Set NDK Paths
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
           export PATH="$NDK_BIN:$PATH"
@@ -98,7 +100,8 @@ jobs:
           fi
           
           CLANG_WRAPPER="${CC_TARGET}-clang"
-          
+
+          # Configure Linker
           LINKER_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
           if [ -f "$NDK_BIN/$CLANG_WRAPPER" ]; then
              export $LINKER_VAR="$NDK_BIN/$CLANG_WRAPPER"
@@ -110,21 +113,21 @@ jobs:
           MOCK_DIR="$(pwd)/mock_libs"
           mkdir -p "$MOCK_DIR"
 
-          echo "🔨 Generating fake libpython with SONAME..."
-          "$NDK_BIN/clang" --target=$CC_TARGET \
-              -shared \
-              -Wl,-soname,libpython$PY_VER.so \
-              -o "$MOCK_DIR/libpython$PY_VER.so" \
-              -xc /dev/null
+          # Create a fake libpython just for detection (PyO3 needs to find something)
+          "$NDK_BIN/clang" --target=$CC_TARGET -shared -o "$MOCK_DIR/libpython$PY_VER.so" -xc /dev/null
 
+          # Copy real libdl.so from NDK sysroot
           LIBDL_PATH=$(find "$NDK_SYSROOT" -name "libdl.so" | grep "$NDK_LIB_ARCH" | head -n 1)
           cp "$LIBDL_PATH" "$MOCK_DIR/"
           
+          # [CRITICAL FIX] Disable Py_ENABLE_SHARED to prevent explicit linking
+          # We want the module to have undefined symbols resolved by the main process
           cat > "$MOCK_DIR/_sysconfigdata__linux_${RUST_TARGET}.py" <<EOF
           build_time_vars = {
               'SO': '.so', 'SOABI': 'cpython-$PY_VER', 'EXT_SUFFIX': '.so',
               'LIBDIR': '$MOCK_DIR', 'LDLIBRARY': 'libpython$PY_VER.so',
-              'Py_ENABLE_SHARED': 1, 'CC': 'clang', 'CXX': 'clang++',
+              'Py_ENABLE_SHARED': 0, 
+              'CC': 'clang', 'CXX': 'clang++',
               'VERSION': '$PY_VER', 'LDSHARED': 'clang -shared',
               'LDFLAGS': '', 'CCSHARED': '-fPIC', 'GNULD': 'yes',
           }
@@ -135,8 +138,10 @@ jobs:
           export PYO3_CROSS_PYTHON_VERSION="$PY_VER"
           export LIBRARY_PATH="$MOCK_DIR:$LIBRARY_PATH"
 
+          # Configure Rust Flags
+          # We REMOVE '-lpython' here. Symbols are left undefined (ignore-all).
           RUSTFLAGS_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_RUSTFLAGS"
-          export $RUSTFLAGS_VAR="-L native=$MOCK_DIR -lpython$PY_VER -C link-arg=--target=$CC_TARGET -C link-arg=-Wl,--unresolved-symbols=ignore-all"
+          export $RUSTFLAGS_VAR="-L native=$MOCK_DIR -C link-arg=--target=$CC_TARGET -C link-arg=-Wl,--unresolved-symbols=ignore-all"
 
           # --- Build ---
           mkdir -p build_src && cd build_src
@@ -149,6 +154,7 @@ jobs:
           # --- Rename Output ---
           cd target/wheels
           OLD=$(ls *.whl)
+          # Rename platform tag to 'linux' for pip compatibility on Termux
           NEW=$(echo "$OLD" | sed -E "s/(-[^-]+)\.whl$/-${PLAT_TAG}.whl/")
           mv "$OLD" "$NEW"
           
@@ -189,6 +195,7 @@ jobs:
           for wheel in temp_wheels/*.whl; do
             filename=$(basename "$wheel")
             
+            # Extract python version (cp310 -> 3.10)
             py_tag=$(echo "$filename" | grep -oP 'cp\d+' | head -n1)
             py_num=${py_tag#cp}
             
@@ -213,10 +220,7 @@ jobs:
           commit-message: "feat: Add wheels for ${{ env.PACKAGE_NAME }} v${{ needs.check-version.outputs.version }}"
           committer: GitHub <noreply@github.com>
           author: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>
-          
-          # Fix: Unique branch name to avoid conflict with closed PRs
           branch: "add-wheels-${{ needs.check-version.outputs.version }}-${{ github.run_id }}"
-          
           delete-branch: true
           title: "feat: Add ${{ env.PACKAGE_NAME }} ${{ needs.check-version.outputs.version }}"
           body: |
@@ -229,4 +233,4 @@ jobs:
             - Added pre-compiled wheels for Android (Termux).
             - Architectures: `arm64`, `armv7`, `x86`, `x86_64`
             - Python Versions: 3.9 - 3.13
-            - **Fix:** SONAME added to ensure dynamic linking works properly.
+            - **Fix:** Disabled `Py_ENABLE_SHARED` to prevent symbol relocation errors at runtime.
