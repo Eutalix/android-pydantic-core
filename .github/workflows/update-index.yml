@@ -1,14 +1,14 @@
 name: Update PyPI Index
 
 on:
-  workflow_dispatch: # Allows manual trigger to index existing releases
+  workflow_dispatch:
   release:
-    types: [published, edited, released] # Triggers automatically on new releases
+    types: [published, edited, released, deleted]
 
 permissions:
-  contents: read  # Required to list releases
-  pages: write    # Required to deploy to GitHub Pages
-  id-token: write # Required for OIDC authentication (Pages)
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   build-index:
@@ -20,15 +20,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Generate Index HTML
+      - name: Generate Static Site
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PKG_NAME: "pydantic-core" # The exact package name
+          PKG_NAME: "pydantic-core"
         run: |
           mkdir -p site
           
-          # Inline Python script to generate PEP 503 compliant HTML
+          # Write the generator script
           cat <<EOF > generate_index.py
           import os
           import json
@@ -38,15 +38,20 @@ jobs:
           repo = os.environ['REPO']
           pkg_name = os.environ['PKG_NAME']
           
-          # PEP 503 Normalization: names should be kebab-case (hyphens) and lowercase
-          # e.g., pydantic_core -> pydantic-core
+          # PEP 503: Normalized name (lowercase, hyphens)
+          # pydantic_core -> pydantic-core
           normalized_name = pkg_name.replace('_', '-').lower()
 
           print(f"🔍 Fetching releases for {repo}...")
           
-          # Fetch all releases using GitHub CLI
-          # We extract the direct download URL (url) and the filename (name)
-          cmd = ["gh", "release", "list", "--repo", repo, "--limit", "200", "--json", "assets"]
+          # Request specific fields to match your JSON structure
+          cmd = [
+              "gh", "release", "list", 
+              "--repo", repo, 
+              "--limit", "100", 
+              "--json", "assets" 
+          ]
+          
           result = subprocess.run(cmd, capture_output=True, text=True)
           
           if result.returncode != 0:
@@ -55,7 +60,7 @@ jobs:
 
           releases = json.loads(result.stdout)
           
-          # Target Directory: site/pydantic-core/index.html
+          # Create directory: site/pydantic-core/
           target_dir = f"site/{normalized_name}"
           os.makedirs(target_dir, exist_ok=True)
           
@@ -63,16 +68,18 @@ jobs:
           html_links = []
 
           for release in releases:
-              for asset in release['assets']:
+              for asset in release.get('assets', []):
                   name = asset['name']
-                  url = asset['url']
                   
-                  if name.endswith('.whl'):
-                      # Create a simple anchor link for pip
-                      html_links.append(f'<a href="{url}">{name}</a>')
+                  # CRITICAL: Use 'browser_download_url' for public access.
+                  # 'url' is the API endpoint and will fail with 403/404 for pip.
+                  download_url = asset.get('browser_download_url')
+                  
+                  if name.endswith('.whl') and download_url:
+                      html_links.append(f'<a href="{download_url}">{name}</a>')
                       wheel_count += 1
 
-          # Generate Package Index HTML
+          # 1. Generate Package Index (site/pydantic-core/index.html)
           html_content = f"""<!DOCTYPE html>
           <html>
           <body>
@@ -84,13 +91,23 @@ jobs:
           with open(f"{target_dir}/index.html", "w") as f:
               f.write(html_content)
               
-          # Generate Root Index (for human navigation)
-          with open("site/index.html", "w") as f:
-              f.write(f'<html><body><h1>My Termux Wheels</h1><a href="{normalized_name}/">{normalized_name}</a></body></html>')
+          # 2. Generate Root Redirect (site/index.html)
+          # This helps if you visit the root URL in a browser
+          root_content = f"""<!DOCTYPE html>
+          <html>
+          <head><meta http-equiv="refresh" content="0; url={normalized_name}/" /></head>
+          <body>
+              <a href="{normalized_name}/">Go to {normalized_name}</a>
+          </body>
+          </html>"""
 
-          print(f"✅ Generated index for {normalized_name} containing {wheel_count} wheels.")
+          with open("site/index.html", "w") as f:
+              f.write(root_content)
+
+          print(f"✅ Generated index for {normalized_name} with {wheel_count} wheels.")
           EOF
           
+          # Run the script
           python3 generate_index.py
 
       - name: Upload Pages Artifact
