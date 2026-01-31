@@ -17,7 +17,7 @@ env:
   ANDROID_API: 24
 
 permissions:
-  contents: write # Required for creating Releases
+  contents: write 
 
 jobs:
   check-version:
@@ -101,7 +101,7 @@ jobs:
           yes | sdkmanager "ndk;${{ env.NDK_VERSION }}" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
 
-      - name: Build Wheel (Neutral Linker Strategy)
+      - name: Build Wheel (Termux Fix)
         id: build_step
         run: |
           set -e
@@ -149,24 +149,25 @@ jobs:
              export $LINKER_VAR="$NDK_BIN/clang"
           fi
 
-          # --- Mocking Python (Neutral Linker Strategy) ---
-          # Goal: Create a wheel that depends on "libpythonX.Y.so" but not on a specific path.
+          # --- Mocking Python (Termux Strategy) ---
           MOCK_DIR="$(pwd)/mock_libs"
           mkdir -p "$MOCK_DIR"
 
           # 1. Create fake libpython with SONAME
-          # The -Wl,-soname is crucial so the elf header only records the filename, not the full path.
           "$NDK_BIN/clang" --target=$CC_TARGET -shared \
             -Wl,-soname,libpython$PY_VER.so \
             -o "$MOCK_DIR/libpython$PY_VER.so" -xc /dev/null
 
-          # 2. Copy real libdl.so from NDK
+          # 2. Copy real libdl.so
           LIBDL_PATH=$(find "$NDK_SYSROOT" -name "libdl.so" | grep "$NDK_LIB_ARCH" | head -n 1)
           cp "$LIBDL_PATH" "$MOCK_DIR/"
           
-          # 3. Sysconfig: Enable Shared to force DT_NEEDED entry
-          cat > "$MOCK_DIR/_sysconfigdata__linux_${RUST_TARGET}.py" <<EOF
+          # 3. Create Sysconfig File (BUT DO NOT EXPORT VAR YET)
+          SYSCONFIG_NAME="_sysconfigdata__linux_${RUST_TARGET}"
+          cat > "$MOCK_DIR/${SYSCONFIG_NAME}.py" <<EOF
           build_time_vars = {
+              'abiflags': '',
+              'ABIFLAGS': '',
               'SO': '.so', 'SOABI': 'cpython-$PY_VER', 'EXT_SUFFIX': '.so',
               'LIBDIR': '$MOCK_DIR', 
               'LDLIBRARY': 'libpython$PY_VER.so',
@@ -174,32 +175,43 @@ jobs:
               'CC': 'clang', 'CXX': 'clang++',
               'VERSION': '$PY_VER', 'LDSHARED': 'clang -shared',
               'LDFLAGS': '-L$MOCK_DIR', 'CCSHARED': '-fPIC', 'GNULD': 'yes',
+              'Py_DEBUG': 0, 'WITH_PYMALLOC': 1,
           }
           EOF
 
-          export PYO3_CROSS_LIB_DIR="$MOCK_DIR"
-          export PYTHONPATH="$MOCK_DIR:$PYTHONPATH"
-          export PYO3_CROSS_PYTHON_VERSION="$PY_VER"
-          export _PYTHON_SYSCONFIGDATA_NAME="_sysconfigdata__linux_${RUST_TARGET}"
-
-          # 4. Rust Flags: Link against mock, but ignore undefined symbols
-          # -lpython$PY_VER: Forces linking
-          # --unresolved-symbols=ignore-all: Ignores that our mock lib is empty
-          RUSTFLAGS_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_RUSTFLAGS"
-          export $RUSTFLAGS_VAR="-L native=$MOCK_DIR -C link-arg=--target=$CC_TARGET -C link-arg=-lpython$PY_VER -C link-arg=-Wl,--unresolved-symbols=ignore-all"
-
-          # --- Build ---
+          # --- Download Source Code (CLEAN ENVIRONMENT) ---
+          # Run pip BEFORE exporting cross-compilation env vars
           mkdir -p build_src && cd build_src
+          echo "Downloading source for $PKG_VER..."
           pip download "${{ env.PACKAGE_NAME }}==$PKG_VER" --no-binary :all: --no-deps
           tar -xzf pydantic?core-*.tar.gz
           cd pydantic?core-*/
 
+          # --- APPLY CROSS-COMPILATION ENV VARS NOW ---
+          export PYO3_CROSS_LIB_DIR="$MOCK_DIR"
+          export PYTHONPATH="$MOCK_DIR:$PYTHONPATH"
+          export PYO3_CROSS_PYTHON_VERSION="$PY_VER"
+          export _PYTHON_SYSCONFIGDATA_NAME="$SYSCONFIG_NAME"
+          
+          # --- Rust Flags ---
+          # 1. --no-as-needed: Forces recording of libpython dependency
+          # 2. -rpath: Hardcodes Termux library path
+          RUSTFLAGS_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_RUSTFLAGS"
+          export $RUSTFLAGS_VAR="\
+          -L native=$MOCK_DIR \
+          -C link-arg=--target=$CC_TARGET \
+          -C link-arg=-Wl,--no-as-needed \
+          -C link-arg=-lpython$PY_VER \
+          -C link-arg=-Wl,--as-needed \
+          -C link-arg=-Wl,--unresolved-symbols=ignore-all \
+          -C link-arg=-Wl,-rpath=/data/data/com.termux/files/usr/lib"
+
+          echo "Starting Maturin Build..."
           maturin build --release --strip --target "$RUST_TARGET" --interpreter python$PY_VER --skip-auditwheel
 
           # --- Rename Output ---
           cd target/wheels
           OLD=$(ls *.whl)
-          # Replace platform tag with linux for Termux compatibility
           NEW=$(echo "$OLD" | sed -E "s/(-[^-]+)\.whl$/-${PLAT_TAG}.whl/")
           mv "$OLD" "$NEW"
           
@@ -243,11 +255,13 @@ jobs:
             - **Python:** 3.9 - 3.13
             
             **Installation:**
-            Download the wheel for your architecture and Python version, then:
             ```bash
             pip install pydantic_core-*.whl
             ```
             
-            > **Note:** These wheels are built with a neutral linker strategy to ensure compatibility with Termux `libpython` location.
+            **Technical Details:**
+            - Built with NDK r25b (API 24)
+            - Includes `RPATH` fix for Termux library location
+            - Linked with `--no-as-needed` to ensure `libpython` loading
           files: wheels/*.whl
           make_latest: true
