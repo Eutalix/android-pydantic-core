@@ -28,7 +28,6 @@ jobs:
         run: |
           mkdir -p site
           
-          # Write the generator script
           cat <<EOF > generate_index.py
           import os
           import json
@@ -37,30 +36,26 @@ jobs:
 
           repo = os.environ['REPO']
           pkg_name = os.environ['PKG_NAME']
-          
-          # PEP 503: Normalized name (lowercase, hyphens)
-          # pydantic_core -> pydantic-core
           normalized_name = pkg_name.replace('_', '-').lower()
 
-          print(f"🔍 Fetching releases for {repo}...")
+          print(f"🔍 Fetching releases from API for {repo}...")
           
-          # Request specific fields to match your JSON structure
-          cmd = [
-              "gh", "release", "list", 
-              "--repo", repo, 
-              "--limit", "100", 
-              "--json", "assets" 
-          ]
+          # [FIX] Use 'gh api' instead of 'gh release list'
+          # This ensures we get the full JSON with 'assets' and 'browser_download_url'
+          cmd = ["gh", "api", f"repos/{repo}/releases", "--paginate"]
           
           result = subprocess.run(cmd, capture_output=True, text=True)
           
           if result.returncode != 0:
-              print(f"❌ Error fetching releases: {result.stderr}")
+              print(f"❌ API Error: {result.stderr}")
               sys.exit(1)
 
-          releases = json.loads(result.stdout)
+          try:
+              releases = json.loads(result.stdout)
+          except json.JSONDecodeError:
+              print("❌ Error decoding JSON response")
+              sys.exit(1)
           
-          # Create directory: site/pydantic-core/
           target_dir = f"site/{normalized_name}"
           os.makedirs(target_dir, exist_ok=True)
           
@@ -68,18 +63,19 @@ jobs:
           html_links = []
 
           for release in releases:
+              # Skip drafts if necessary, though 'gh api' returns them by default
+              if release.get('draft'):
+                  continue
+                  
               for asset in release.get('assets', []):
                   name = asset['name']
-                  
-                  # CRITICAL: Use 'browser_download_url' for public access.
-                  # 'url' is the API endpoint and will fail with 403/404 for pip.
                   download_url = asset.get('browser_download_url')
                   
                   if name.endswith('.whl') and download_url:
                       html_links.append(f'<a href="{download_url}">{name}</a>')
                       wheel_count += 1
 
-          # 1. Generate Package Index (site/pydantic-core/index.html)
+          # Generate Index HTML
           html_content = f"""<!DOCTYPE html>
           <html>
           <body>
@@ -91,14 +87,11 @@ jobs:
           with open(f"{target_dir}/index.html", "w") as f:
               f.write(html_content)
               
-          # 2. Generate Root Redirect (site/index.html)
-          # This helps if you visit the root URL in a browser
+          # Root Redirect
           root_content = f"""<!DOCTYPE html>
           <html>
           <head><meta http-equiv="refresh" content="0; url={normalized_name}/" /></head>
-          <body>
-              <a href="{normalized_name}/">Go to {normalized_name}</a>
-          </body>
+          <body><a href="{normalized_name}/">Go to {normalized_name}</a></body>
           </html>"""
 
           with open("site/index.html", "w") as f:
@@ -107,7 +100,6 @@ jobs:
           print(f"✅ Generated index for {normalized_name} with {wheel_count} wheels.")
           EOF
           
-          # Run the script
           python3 generate_index.py
 
       - name: Upload Pages Artifact
