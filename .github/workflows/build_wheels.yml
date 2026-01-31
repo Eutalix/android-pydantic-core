@@ -1,31 +1,68 @@
-name: Build Wheels & PR
+name: Android Wheels & Release
 
 on:
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if release exists'
+        required: false
+        default: false
+        type: boolean
   schedule:
-    - cron: '0 0 1 * *' # Scheduled monthly check
+    - cron: '0 0 1 * *' # Run monthly on the 1st
 
 env:
   PACKAGE_NAME: pydantic-core
   NDK_VERSION: '25.2.9519653' # NDK r25b (Stable LTS)
   ANDROID_API: 24
 
+permissions:
+  contents: write # Required for creating Releases
+
 jobs:
   check-version:
-    name: Check PyPI Version
+    name: Check Version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.pypi.outputs.version }}
+      should_build: ${{ steps.check_release.outputs.should_build }}
     steps:
+      - uses: actions/checkout@v4
+      
       - id: pypi
+        name: Get Latest PyPI Version
         run: |
           VER=$(curl -s https://pypi.org/pypi/${{ env.PACKAGE_NAME }}/json | python3 -c "import sys, json; print(json.load(sys.stdin)['info']['version'])")
           echo "Latest PyPI version: $VER"
           echo "version=$VER" >> $GITHUB_OUTPUT
 
+      - id: check_release
+        name: Check if Release Exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force_build }}
+        run: |
+          VER="${{ steps.pypi.outputs.version }}"
+          TAG="v$VER"
+          
+          if [ "$FORCE" == "true" ]; then
+            echo "Force build enabled."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists. Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "Release $TAG not found. Starting build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
   build:
     name: Build ${{ matrix.arch }} (Py${{ matrix.python-version }})
     needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -43,6 +80,14 @@ jobs:
           source "$HOME/.cargo/env"
           rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
 
+      - name: Cache Cargo Registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Setup Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -53,11 +98,10 @@ jobs:
 
       - name: Install NDK r25b
         run: |
-          echo "Installing NDK ${{ env.NDK_VERSION }}..."
           yes | sdkmanager "ndk;${{ env.NDK_VERSION }}" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
 
-      - name: Build Wheel
+      - name: Build Wheel (Neutral Linker Strategy)
         id: build_step
         run: |
           set -e
@@ -67,16 +111,13 @@ jobs:
           PY_VER="${{ matrix.python-version }}"
           PKG_VER="${{ needs.check-version.outputs.version }}"
           ARCH="${{ matrix.arch }}"
-          
-          # Required by Maturin
           export ANDROID_API_LEVEL=${{ env.ANDROID_API }}
           
-          # Set NDK Paths
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
           export PATH="$NDK_BIN:$PATH"
 
-          # --- Target Architecture Setup ---
+          # --- Architecture Config ---
           if [ "$ARCH" == "arm64-v8a" ]; then
              RUST_TARGET="aarch64-linux-android"
              CC_TARGET="aarch64-linux-android${ANDROID_API}"
@@ -99,9 +140,8 @@ jobs:
              PLAT_TAG="linux_x86_64"
           fi
           
+          # --- Configure Linker ---
           CLANG_WRAPPER="${CC_TARGET}-clang"
-
-          # Configure Linker
           LINKER_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
           if [ -f "$NDK_BIN/$CLANG_WRAPPER" ]; then
              export $LINKER_VAR="$NDK_BIN/$CLANG_WRAPPER"
@@ -109,39 +149,44 @@ jobs:
              export $LINKER_VAR="$NDK_BIN/clang"
           fi
 
-          # --- Mocking Python Environment ---
+          # --- Mocking Python (Neutral Linker Strategy) ---
+          # Goal: Create a wheel that depends on "libpythonX.Y.so" but not on a specific path.
           MOCK_DIR="$(pwd)/mock_libs"
           mkdir -p "$MOCK_DIR"
 
-          # Create a fake libpython just for detection (PyO3 needs to find something)
-          "$NDK_BIN/clang" --target=$CC_TARGET -shared -o "$MOCK_DIR/libpython$PY_VER.so" -xc /dev/null
+          # 1. Create fake libpython with SONAME
+          # The -Wl,-soname is crucial so the elf header only records the filename, not the full path.
+          "$NDK_BIN/clang" --target=$CC_TARGET -shared \
+            -Wl,-soname,libpython$PY_VER.so \
+            -o "$MOCK_DIR/libpython$PY_VER.so" -xc /dev/null
 
-          # Copy real libdl.so from NDK sysroot
+          # 2. Copy real libdl.so from NDK
           LIBDL_PATH=$(find "$NDK_SYSROOT" -name "libdl.so" | grep "$NDK_LIB_ARCH" | head -n 1)
           cp "$LIBDL_PATH" "$MOCK_DIR/"
           
-          # [CRITICAL FIX] Disable Py_ENABLE_SHARED to prevent explicit linking
-          # We want the module to have undefined symbols resolved by the main process
+          # 3. Sysconfig: Enable Shared to force DT_NEEDED entry
           cat > "$MOCK_DIR/_sysconfigdata__linux_${RUST_TARGET}.py" <<EOF
           build_time_vars = {
               'SO': '.so', 'SOABI': 'cpython-$PY_VER', 'EXT_SUFFIX': '.so',
-              'LIBDIR': '$MOCK_DIR', 'LDLIBRARY': 'libpython$PY_VER.so',
-              'Py_ENABLE_SHARED': 0, 
+              'LIBDIR': '$MOCK_DIR', 
+              'LDLIBRARY': 'libpython$PY_VER.so',
+              'Py_ENABLE_SHARED': 1, 
               'CC': 'clang', 'CXX': 'clang++',
               'VERSION': '$PY_VER', 'LDSHARED': 'clang -shared',
-              'LDFLAGS': '', 'CCSHARED': '-fPIC', 'GNULD': 'yes',
+              'LDFLAGS': '-L$MOCK_DIR', 'CCSHARED': '-fPIC', 'GNULD': 'yes',
           }
           EOF
 
           export PYO3_CROSS_LIB_DIR="$MOCK_DIR"
           export PYTHONPATH="$MOCK_DIR:$PYTHONPATH"
           export PYO3_CROSS_PYTHON_VERSION="$PY_VER"
-          export LIBRARY_PATH="$MOCK_DIR:$LIBRARY_PATH"
+          export _PYTHON_SYSCONFIGDATA_NAME="_sysconfigdata__linux_${RUST_TARGET}"
 
-          # Configure Rust Flags
-          # We REMOVE '-lpython' here. Symbols are left undefined (ignore-all).
+          # 4. Rust Flags: Link against mock, but ignore undefined symbols
+          # -lpython$PY_VER: Forces linking
+          # --unresolved-symbols=ignore-all: Ignores that our mock lib is empty
           RUSTFLAGS_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_RUSTFLAGS"
-          export $RUSTFLAGS_VAR="-L native=$MOCK_DIR -C link-arg=--target=$CC_TARGET -C link-arg=-Wl,--unresolved-symbols=ignore-all"
+          export $RUSTFLAGS_VAR="-L native=$MOCK_DIR -C link-arg=--target=$CC_TARGET -C link-arg=-lpython$PY_VER -C link-arg=-Wl,--unresolved-symbols=ignore-all"
 
           # --- Build ---
           mkdir -p build_src && cd build_src
@@ -154,12 +199,11 @@ jobs:
           # --- Rename Output ---
           cd target/wheels
           OLD=$(ls *.whl)
-          # Rename platform tag to 'linux' for pip compatibility on Termux
+          # Replace platform tag with linux for Termux compatibility
           NEW=$(echo "$OLD" | sed -E "s/(-[^-]+)\.whl$/-${PLAT_TAG}.whl/")
           mv "$OLD" "$NEW"
           
-          FULL_PATH="$(pwd)/$NEW"
-          echo "WHEEL_PATH=$FULL_PATH" >> $GITHUB_OUTPUT
+          echo "WHEEL_PATH=$(pwd)/$NEW" >> $GITHUB_OUTPUT
 
       - name: Upload Temporary Artifact
         uses: actions/upload-artifact@v4
@@ -168,69 +212,42 @@ jobs:
           path: ${{ steps.build_step.outputs.WHEEL_PATH }}
           retention-days: 1
 
-  create-pr:
-    name: Create Pull Request
+  release:
+    name: Create GitHub Release
     needs: [check-version, build]
+    if: needs.check-version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
       - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: temp_wheels
+          path: wheels
           merge-multiple: true
 
-      - name: Organize Directory Structure
-        run: |
-          PKG_VER="${{ needs.check-version.outputs.version }}"
-          PKG_NAME="${{ env.PACKAGE_NAME }}"
-          
-          echo "Organizing files for $PKG_NAME v$PKG_VER..."
-          
-          for wheel in temp_wheels/*.whl; do
-            filename=$(basename "$wheel")
-            
-            # Extract python version (cp310 -> 3.10)
-            py_tag=$(echo "$filename" | grep -oP 'cp\d+' | head -n1)
-            py_num=${py_tag#cp}
-            
-            if [ ${#py_num} -eq 2 ]; then
-               py_folder="${py_num:0:1}.${py_num:1:1}"
-            else
-               py_folder="${py_num:0:1}.${py_num:1:2}"
-            fi
-            
-            TARGET_DIR="python/$py_folder/$PKG_NAME/$PKG_VER"
-            
-            mkdir -p "$TARGET_DIR"
-            mv "$wheel" "$TARGET_DIR/"
-            echo "Moved $filename -> $TARGET_DIR/"
-          done
-          rm -rf temp_wheels
-
-      - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v6
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "feat: Add wheels for ${{ env.PACKAGE_NAME }} v${{ needs.check-version.outputs.version }}"
-          committer: GitHub <noreply@github.com>
-          author: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>
-          branch: "add-wheels-${{ needs.check-version.outputs.version }}-${{ github.run_id }}"
-          delete-branch: true
-          title: "feat: Add ${{ env.PACKAGE_NAME }} ${{ needs.check-version.outputs.version }}"
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: ${{ env.PACKAGE_NAME }} v${{ needs.check-version.outputs.version }}
           body: |
             ### Automated Android Build 🤖
             
             **Package:** `${{ env.PACKAGE_NAME }}`
             **Version:** `${{ needs.check-version.outputs.version }}`
             
-            **Changes:**
-            - Added pre-compiled wheels for Android (Termux).
-            - Architectures: `arm64`, `armv7`, `x86`, `x86_64`
-            - Python Versions: 3.9 - 3.13
-            - **Fix:** Disabled `Py_ENABLE_SHARED` to prevent symbol relocation errors at runtime.
+            **Platform Support:**
+            - **OS:** Android (Termux)
+            - **Archs:** `aarch64`, `armv7`, `x86`, `x86_64`
+            - **Python:** 3.9 - 3.13
+            
+            **Installation:**
+            Download the wheel for your architecture and Python version, then:
+            ```bash
+            pip install pydantic_core-*.whl
+            ```
+            
+            > **Note:** These wheels are built with a neutral linker strategy to ensure compatibility with Termux `libpython` location.
+          files: wheels/*.whl
+          make_latest: true
