@@ -1,8 +1,8 @@
 # 📱 Android Pydantic Core
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/Eutalix/android-pydantic-core/build_wheels.yml?label=Build)](https://github.com/Eutalix/android-pydantic-core/actions)
-[![Python Versions](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://github.com/Eutalix/android-pydantic-core/tree/main/python)
-[![Architectures](https://img.shields.io/badge/arch-arm64%20%7C%20armv7%20%7C%20x86%20%7C%20x86__64-orange)]()
+[![Build & Release](https://img.shields.io/github/actions/workflow/status/Eutalix/android-pydantic-core/android-release.yml?label=Build)](https://github.com/Eutalix/android-pydantic-core/actions)
+[![Python Versions](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://github.com/Eutalix/android-pydantic-core/releases)
+[![Architectures](https://img.shields.io/badge/arch-arm64%20%7C%20armv7%20%7C%20x86%20%7C%20x86__64-orange)](https://github.com/Eutalix/android-pydantic-core/releases)
 
 **Automated builds of `pydantic-core` optimized for Android (Termux).**
 
@@ -23,35 +23,41 @@ Compiling `pydantic-core` on Android requires a Rust toolchain and takes ~15 min
 
 ## 🚀 Installation
 
-### ⚡ Option 1: Automatic (Recommended)
-Run this single command in Termux. It auto-detects your Python version and Architecture to install the correct wheel.
+### ⚡ Option 1: Quick Install (Script)
+Use this if you want the installer to **auto-detect** your architecture and Python version.
 
 ```bash
 curl -sL https://raw.githubusercontent.com/Eutalix/android-pydantic-core/main/install_pydantic_core.sh | bash
 ```
 
-### 🛠️ Option 2: Manual
-You can also install directly via URL if you know your specific version/architecture.
+### 🐍 Option 2: Pip (Standard)
+Best for requirements files or CI/CD.
 
-**Raw URL Pattern:**
-```
-https://raw.githubusercontent.com/Eutalix/android-pydantic-core/main/python/{py_ver}/pydantic-core/{ver}/{filename}.whl
-```
-
-**Example (Python 3.12 on ARM64):**
 ```bash
-pip install https://raw.githubusercontent.com/Eutalix/android-pydantic-core/main/python/3.12/pydantic-core/2.41.5/pydantic_core-2.41.5-cp312-cp312-linux_aarch64.whl
+pip install pydantic-core --extra-index-url https://eutalix.github.io/android-pydantic-core/
 ```
+
+### 📦 Option 3: Manual Download
+You can manually download the `.whl` files from the [Releases Page](https://github.com/Eutalix/android-pydantic-core/releases).
+
+1. Download the file matching your Python version (`cp312`) and Architecture (`aarch64`).
+2. Install it:
+   ```bash
+   pip install pydantic_core-*.whl
+   ```
 
 ---
 
 ## 🛠️ How it works
 
 This repository uses **GitHub Actions** to cross-compile wheels using the Android NDK r25b.
-1.  Checks PyPI for new versions daily.
-2.  Builds wheels for all architectures/python versions using `maturin`.
-3.  Renames artifacts to `linux_{arch}` to ensure compatibility with Termux `pip`.
-4.  Commits the binaries to this repository automatically.
+
+1.  **Checks PyPI** for new versions daily.
+2.  **Cross-compiles** using `maturin` and patched linker flags:
+    *   **RPATH Fix:** Hardcodes Termux library paths (`/data/data/com.termux/files/usr/lib`) so the linker finds `libpython`.
+    *   **Force Needed:** Uses `--no-as-needed` to ensure `libpython` dependencies are correctly recorded.
+3.  **Renames** artifacts to `linux_{arch}` for Termux compatibility.
+4.  **Publishes** wheels to GitHub Releases and updates the PEP 503 Index.
 
 ## 🤝 Credits
 
