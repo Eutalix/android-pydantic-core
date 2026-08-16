@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
         arch: ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64']
     steps:
       - name: Checkout Repository
@@ -252,7 +252,7 @@ jobs:
             **Platform Support:**
             - **OS:** Android (Termux)
             - **Archs:** `aarch64`, `armv7`, `x86`, `x86_64`
-            - **Python:** 3.9 - 3.13
+            - **Python:** 3.9 - 3.14
             
             **Installation:**
             ```bash
