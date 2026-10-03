@@ -3,14 +3,11 @@ name: Check for New pydantic-core Version
 on:
   workflow_dispatch:
   schedule:
-    # Cheap PyPI JSON + GitHub tags check — independent of pydantic-core's
-    # own release cadence, this just decides whether build_wheels.yml
-    # needs to run.
     - cron: '0 6 * * *'
 
 permissions:
   contents: read
-  actions: write  # required for `gh workflow run` below
+  actions: write
 
 jobs:
   check:
@@ -26,7 +23,7 @@ jobs:
         run: pip install -e ./ci_tool
 
       - id: check
-        name: Compare latest PyPI version against existing releases
+        name: Find newest buildable pydantic-core version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -40,7 +37,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "New version detected: ${{ steps.check.outputs.package_version }} (tag ${{ steps.check.outputs.upstream_ref }})"
+          echo "New version detected: ${{ steps.check.outputs.package_version }} (commit ${{ steps.check.outputs.upstream_ref }})"
+          # Both pydantic_core_ref (a raw commit SHA — pydantic-core has
+          # no tags of its own inside the pydantic/pydantic monorepo) and
+          # release_version are passed explicitly here, since they're
+          # computed together and always in sync; build_wheels.yml can't
+          # derive the version from the SHA itself.
           gh workflow run build_wheels.yml \
             --ref ${{ github.ref_name }} \
-            -f pydantic_core_ref=${{ steps.check.outputs.upstream_ref }}
+            -f pydantic_core_ref=${{ steps.check.outputs.upstream_ref }} \
+            -f release_version=${{ steps.check.outputs.package_version }}
