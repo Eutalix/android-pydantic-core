@@ -1,0 +1,46 @@
+name: Check for New pydantic-core Version
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Cheap PyPI JSON check — independent of pydantic-core's own release
+    # cadence, this just decides whether build_wheels.yml needs to run.
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+  actions: write  # required for `gh workflow run` below
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ci_tool
+        run: pip install -e ./ci_tool
+
+      - id: check
+        name: Compare latest PyPI version against existing releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -m ci_tool check-upstream \
+            --repo ${{ github.repository }} \
+            --package-name pydantic-core \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Trigger build for new version
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "New version detected: ${{ steps.check.outputs.package_version }}"
+          gh workflow run build_wheels.yml \
+            --ref ${{ github.ref_name }} \
+            -f pydantic_core_ref=${{ steps.check.outputs.upstream_ref }} \
+            -f release_version=${{ steps.check.outputs.package_version }}
