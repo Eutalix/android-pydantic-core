@@ -19,7 +19,7 @@ from .pypi_index import build_index
 from .release_notes import ReleaseContext, WheelBuildInfo, render
 from .sysconfigdata import write as write_sysconfigdata
 from .termux import fetch_libpython_for_arch
-from .upstream import check_for_update
+from .upstream import UPSTREAM_REPO_DEFAULT, check_for_update, version_from_ref
 from .wheel_tags import android_abi_tag
 
 
@@ -149,8 +149,9 @@ def _generate_index(args: argparse.Namespace) -> None:
 
 
 def _check_upstream(args: argparse.Namespace) -> None:
-    result = check_for_update(args.repo, args.package_name, ref_template=args.ref_template)
+    result = check_for_update(args.repo, args.package_name, upstream_repo=args.upstream_repo)
     print(f"package_version={result.package_version}")
+    print(f"upstream_ref={result.upstream_ref}")
     print(f"should_build={str(result.should_build).lower()}")
     if args.github_output:
         with open(args.github_output, "a") as f:
@@ -158,6 +159,14 @@ def _check_upstream(args: argparse.Namespace) -> None:
             f.write(f"package_version={result.package_version}\n")
             f.write(f"release_tag={result.release_tag}\n")
             f.write(f"upstream_ref={result.upstream_ref}\n")
+
+
+def _resolve_ref(args: argparse.Namespace) -> None:
+    version = version_from_ref(args.ref) or ""
+    print(f"release_version={version}")
+    if args.github_output:
+        with open(args.github_output, "a") as f:
+            f.write(f"release_version={version}\n")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -209,9 +218,17 @@ def main(argv: list[str] | None = None) -> None:
     )
     cu_p.add_argument("--repo", required=True)
     cu_p.add_argument("--package-name", default="pydantic-core")
-    cu_p.add_argument("--ref-template", default="v{version}")
+    cu_p.add_argument("--upstream-repo", default=UPSTREAM_REPO_DEFAULT)
     cu_p.add_argument("--github-output", default=None)
     cu_p.set_defaults(func=_check_upstream)
+
+    rr_p = sub.add_parser(
+        "resolve-ref",
+        help="Derive a release version from a git ref, if it looks like one",
+    )
+    rr_p.add_argument("--ref", required=True)
+    rr_p.add_argument("--github-output", default=None)
+    rr_p.set_defaults(func=_resolve_ref)
 
     args = parser.parse_args(argv)
     args.func(args)
