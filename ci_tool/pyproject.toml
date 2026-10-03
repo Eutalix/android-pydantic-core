@@ -1,0 +1,19 @@
+[project]
+name = "ci-tool"
+version = "0.1.0"
+description = "Internal build tooling for android-pydantic-core (not published to PyPI)"
+requires-python = ">=3.11"
+dependencies = [
+    "packaging>=24",
+    "requests>=2.32",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
