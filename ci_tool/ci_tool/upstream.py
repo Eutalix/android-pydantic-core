@@ -4,63 +4,50 @@ workflow. Also derives whether a given git ref represents a releasable
 version, used by build_wheels.yml to decide automatically whether a run
 should publish a GitHub Release.
 
-Unlike pypi_index.py (which reads *this* repo's own GitHub Releases to
-build the PEP 503 index), this module reads PyPI — the project being
-repackaged — and cross-references this repo's own releases to decide
-whether a new build run should be kicked off.
+pydantic-core's source and release process moved from its own dedicated
+repo (pydantic/pydantic-core, last tag there: v2.41.5) into the
+pydantic/pydantic monorepo, where it now lives as a subdirectory
+(confirmed: pydantic-core/Cargo.toml exists on pydantic/pydantic's
+default branch). Its pyproject.toml declares `dynamic = ["version"]`
+with maturin as the build backend, meaning the actual released version
+of the `pydantic_core` package is read directly from
+pydantic-core/Cargo.toml's `[package] version` field — not from any git
+tag or release name. The monorepo also has its own, *independent*
+version-number track for the `pydantic` package itself (its "Prepare
+release vX.Y.Z" commits reference pydantic's version, not
+pydantic-core's), so there is no reliable tag or commit-message
+convention to key off of for pydantic-core specifically. Given that,
+this module resolves a PyPI version straight to the exact upstream
+commit by walking pydantic-core/Cargo.toml's own commit history and
+reading its content at each commit — the only approach that doesn't
+depend on guessing a naming convention.
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 import subprocess
 from dataclasses import dataclass
+from typing import Iterator
 
 import requests
 from packaging.version import InvalidVersion, Version
 
 PYPI_JSON_URL = "https://pypi.org/pypi/{package}/json"
-
-# pydantic-core's source and release process moved from its own dedicated
-# repo (pydantic/pydantic-core, last tag there: v2.41.5) into the
-# pydantic/pydantic monorepo, where it now lives as a subdirectory and is
-# released under its own tags *within* that repo — confirmed by finding
-# a real GitHub release titled "pydantic-core v2.46.3" on
-# pydantic/pydantic. Tags there can't just be bare "v{version}" like the
-# old repo used, since the monorepo also tags releases of `pydantic`
-# itself (and pydantic-settings, etc.) — so release names must be
-# disambiguated by package. See find_matching_release().
 UPSTREAM_REPO_DEFAULT = "pydantic/pydantic"
+# Confirmed via `gh api repos/pydantic/pydantic/git/trees/main?recursive=1`.
+UPSTREAM_CARGO_TOML_PATH_DEFAULT = "pydantic-core/Cargo.toml"
 
-_VERSION_PATTERN = r"\d+\.\d+\.\d+(?:[A-Za-z0-9]*)?"
-_VERSION_IN_STRING_RE = re.compile(_VERSION_PATTERN)
-# Anchored to the END of the string only (not the whole string): used on
-# literal, user/automation-provided git refs (pydantic_core_ref), which
-# may now be package-prefixed (e.g. "pydantic-core-v2.46.3") rather than
-# a bare version, now that releases live inside a shared monorepo.
-_VERSION_SUFFIX_RE = re.compile(r"(" + _VERSION_PATTERN + r")$")
+# Matches a (possibly "v"-prefixed) version number anywhere a manually
+# supplied ref might end with one, e.g. "v2.49.0" or "pydantic-core-v2.49.0".
+# Not used to resolve the *automated* flow's ref (that's always a raw
+# commit SHA, which never looks like this) — only as a convenience for a
+# human manually dispatching the workflow against a literal version tag.
+_VERSION_SUFFIX_RE = re.compile(r"v?(\d+\.\d+\.\d+(?:[A-Za-z0-9.+-]*)?)$")
 
-_SEPARATORS_RE = re.compile(r"[-_/\s]+")
-
-
-def _normalize_for_match(s: str) -> str:
-    """Collapses '-', '_', '/', whitespace and lowercases, so tag/release
-    names using any separator convention can be compared against a
-    package name using a different one (e.g. "pydantic-core",
-    "pydantic_core", "pydantic core" all normalize to "pydanticcore")."""
-    return _SEPARATORS_RE.sub("", s).lower()
-
-
-def _repo_is_dedicated_to_package(upstream_repo: str, package_name: str) -> bool:
-    """True for a repo whose own name already identifies the package
-    (the historical single-package-repo layout, e.g.
-    "pydantic/pydantic-core"), where tags are expected to be bare
-    versions with no package-name prefix needed. False for a shared
-    monorepo (e.g. "pydantic/pydantic" hosting pydantic-core as a
-    subdirectory), where releases must mention the package by name to
-    disambiguate from sibling packages' own version tags."""
-    repo_slug = upstream_repo.rsplit("/", 1)[-1]
-    return _normalize_for_match(package_name) in _normalize_for_match(repo_slug)
+_PACKAGE_SECTION_RE = re.compile(r"(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)")
+_VERSION_LINE_RE = re.compile(r'(?m)^version\s*=\s*"([^"]+)"')
 
 
 def _has_published_wheel(files: list[dict]) -> bool:
@@ -79,9 +66,9 @@ def list_stable_pypi_versions(package_name: str) -> list[str]:
     PyPI's JSON API response as "the" latest version, and does NOT
     consider a version "ready" just because *some* file exists for it —
     confirmed in production: pydantic-core 2.49.0 appeared on PyPI with
-    info.version pointing at it while its publish was still incomplete.
-    Requiring a real, non-yanked wheel file is a much better proxy for
-    "this release is actually complete".
+    info.version pointing at it while only an sdist had been uploaded,
+    zero wheels. Requiring a real, non-yanked wheel file is a much
+    better proxy for "this release is actually complete".
     """
     resp = requests.get(PYPI_JSON_URL.format(package=package_name), timeout=30)
     resp.raise_for_status()
@@ -109,83 +96,101 @@ def release_tag_for_version(version: str) -> str:
     return f"v{version}"
 
 
-def normalize_tag(tag: str) -> str:
-    """Strips an optional leading 'v'/'V' (bare-version tag convention,
-    e.g. "v2.41.5" -> "2.41.5")."""
-    return tag[1:] if tag[:1] in ("v", "V") else tag
+def extract_cargo_version(cargo_toml_text: str) -> str | None:
+    """Reads the `[package] version` field from a Cargo.toml's text.
+
+    Deliberately scoped to the [package] section only (not a bare
+    "^version = ..." search over the whole file): Cargo.toml also
+    contains dependency version pins (e.g. `regex = "1.12.3"`) and
+    inline tables with their own "version" keys (e.g.
+    `pyo3 = { version = "0.29.2", ... }`), though none of those happen
+    to collide with a line-anchored "version = ..." pattern in the real
+    file at time of writing — scoping to [package] makes that
+    non-collision a guarantee rather than a coincidence.
+    """
+    section_match = _PACKAGE_SECTION_RE.search(cargo_toml_text)
+    search_space = section_match.group(1) if section_match else cargo_toml_text
+    match = _VERSION_LINE_RE.search(search_space)
+    return match.group(1) if match else None
 
 
-def fetch_upstream_releases(upstream_repo: str) -> list[dict]:
+def iter_path_commits(
+    upstream_repo: str, path: str, max_pages: int = 10, per_page: int = 100
+) -> Iterator[dict]:
+    """Yields commits touching `path` in `upstream_repo`, newest first,
+    fetched one page at a time so resolve_commit_for_version() can stop
+    as soon as it finds a match instead of always paying for the file's
+    entire commit history (which, for a long-lived file like Cargo.toml,
+    can be hundreds of commits)."""
+    for page in range(1, max_pages + 1):
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{upstream_repo}/commits",
+                "-f",
+                f"path={path}",
+                "-f",
+                f"per_page={per_page}",
+                "-f",
+                f"page={page}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"gh api failed listing commits for {path} in {upstream_repo}: {result.stderr}"
+            )
+        batch = json.loads(result.stdout)
+        if not batch:
+            return
+        yield from batch
+        if len(batch) < per_page:
+            return
+
+
+def fetch_file_at_commit(upstream_repo: str, path: str, ref: str) -> str:
     result = subprocess.run(
-        ["gh", "api", f"repos/{upstream_repo}/releases", "--paginate"],
+        ["gh", "api", f"repos/{upstream_repo}/contents/{path}", "-f", f"ref={ref}"],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"gh api failed listing releases for {upstream_repo}: {result.stderr}")
-    return json.loads(result.stdout)
+        raise RuntimeError(
+            f"gh api failed fetching {path}@{ref} in {upstream_repo}: {result.stderr}"
+        )
+    payload = json.loads(result.stdout)
+    return base64.b64decode(payload["content"]).decode("utf-8")
 
 
-def find_matching_release(
-    releases: list[dict], upstream_repo: str, package_name: str, version: str
-) -> str | None:
-    """Returns the real tag_name of the upstream release matching
-    `version`, or None if none exists (yet, or ever).
-
-    Handles two conventions automatically, based on whether
-    `upstream_repo`'s own name identifies `package_name`:
-      - dedicated repo: tags are bare versions ("v2.41.5").
-      - shared monorepo: releases must mention `package_name` (in
-        tag_name and/or the release's display name, any separator
-        style) alongside the version number, to disambiguate from
-        sibling packages released from the same repo.
-    """
-    try:
-        target = Version(version)
-    except InvalidVersion:
-        return None
-
-    dedicated = _repo_is_dedicated_to_package(upstream_repo, package_name)
-    normalized_package = _normalize_for_match(package_name)
-
-    for release in releases:
-        if release.get("draft") or release.get("prerelease"):
-            continue
-        tag_name = release.get("tag_name")
-        if not tag_name:
-            continue
-
-        if dedicated:
-            candidate_version = normalize_tag(tag_name)
-        else:
-            haystack = f"{tag_name} {release.get('name') or ''}"
-            if normalized_package not in _normalize_for_match(haystack):
-                continue
-            match = _VERSION_IN_STRING_RE.search(haystack)
-            candidate_version = match.group(0) if match else None
-
-        if candidate_version is None:
+def resolve_commit_for_version(upstream_repo: str, cargo_toml_path: str, version: str) -> str | None:
+    """The exact upstream commit SHA at which pydantic-core/Cargo.toml's
+    `[package] version` reads `version` — or None if no commit touching
+    that file ever set it to exactly that value (within the pages
+    scanned). This is a real, checkout-able git ref, unlike a tag name
+    that may not exist."""
+    for commit in iter_path_commits(upstream_repo, cargo_toml_path):
+        sha = commit.get("sha")
+        if not sha:
             continue
         try:
-            if Version(candidate_version) == target:
-                return tag_name
-        except InvalidVersion:
+            content = fetch_file_at_commit(upstream_repo, cargo_toml_path, sha)
+        except RuntimeError:
             continue
-
+        if extract_cargo_version(content) == version:
+            return sha
     return None
 
 
 def version_from_ref(ref: str) -> str | None:
-    """Extracts a trailing version number from a git ref, if present —
-    e.g. "v2.46.3" -> "2.46.3", and also "pydantic-core-v2.46.3" ->
-    "2.46.3" (since release tags may now be package-prefixed inside the
-    pydantic/pydantic monorepo). Returns None for refs with no trailing
-    version number at all (branch names like "main", commit SHAs, ...).
-
-    Used by build_wheels.yml to decide, automatically and without a
-    second manually-synchronized input, whether a given run should
-    publish a GitHub Release.
-    """
+    """Convenience for a human manually dispatching the workflow with a
+    literal version-looking ref (e.g. "v2.49.0"). Returns None for
+    anything that doesn't end in a version number — in particular, for
+    the raw commit SHAs the automated check_upstream.yml flow passes,
+    which is why that flow passes the version explicitly instead of
+    relying on this function (see build_wheels.yml's `release_version`
+    input)."""
     match = _VERSION_SUFFIX_RE.search(ref.strip())
     return match.group(1) if match else None
 
@@ -202,9 +207,9 @@ def release_exists(repo: str, tag: str) -> bool:
 
 @dataclass(frozen=True)
 class UpdateCheck:
-    package_version: str | None
+    package_version: str | None  # None => nothing wheel-complete on PyPI has a matching upstream commit
     release_tag: str | None
-    upstream_ref: str | None
+    upstream_ref: str | None  # a commit SHA, not a tag
     already_released: bool
 
     @property
@@ -216,18 +221,19 @@ def check_for_update(
     repo: str,
     package_name: str,
     upstream_repo: str = UPSTREAM_REPO_DEFAULT,
+    cargo_toml_path: str = UPSTREAM_CARGO_TOML_PATH_DEFAULT,
 ) -> UpdateCheck:
     """Walks PyPI's wheel-complete stable versions newest-first and
-    returns the first one upstream has actually released — rather than
-    rigidly chasing whatever PyPI's `info.version` claims is "latest"
-    even when that version isn't fully published, or assuming a fixed
-    tag-naming template that breaks the moment upstream restructures
-    its repos (as happened in production with the move to a monorepo).
+    returns the first one for which pydantic-core/Cargo.toml's own
+    commit history actually has a matching `version = "..."` — rather
+    than trusting PyPI's `info.version` pointer (which can reference an
+    incomplete release) or guessing a tag/release naming convention
+    (which broke twice already: the dedicated repo's tags stopped at
+    v2.41.5, and the monorepo has no pydantic-core-specific tags or
+    release-name convention at all).
     """
-    releases = fetch_upstream_releases(upstream_repo)
-
     for version in list_stable_pypi_versions(package_name):
-        upstream_ref = find_matching_release(releases, upstream_repo, package_name, version)
+        upstream_ref = resolve_commit_for_version(upstream_repo, cargo_toml_path, version)
         if upstream_ref is None:
             continue
         tag = release_tag_for_version(version)
