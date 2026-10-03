@@ -1,267 +1,172 @@
-name: Android Wheels & Release
+name: Build Android Wheels
 
 on:
   workflow_dispatch:
     inputs:
-      force_build:
-        description: 'Force build even if release exists'
-        required: false
-        default: false
-        type: boolean
-  schedule:
-    - cron: '0 0 1 * *' # Run monthly on the 1st
+      pydantic_core_ref:
+        description: "pydantic-core git ref (tag/branch/sha) to build"
+        required: true
+        default: "main"
+  release:
+    types: [published]
 
 env:
-  PACKAGE_NAME: pydantic-core
-  NDK_VERSION: '25.2.9519653' # NDK r25b (Stable LTS)
-  ANDROID_API: 24
-
-permissions:
-  contents: write 
+  ANDROID_API_LEVEL: 24
+  NDK_VERSION: "26.3.11579264"
 
 jobs:
-  check-version:
-    name: Check Version
+  discover:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.pypi.outputs.version }}
-      should_build: ${{ steps.check_release.outputs.should_build }}
+      python_version: ${{ steps.discover.outputs.python_version }}
     steps:
       - uses: actions/checkout@v4
-      
-      - id: pypi
-        name: Get Latest PyPI Version
-        run: |
-          VER=$(curl -s https://pypi.org/pypi/${{ env.PACKAGE_NAME }}/json | python3 -c "import sys, json; print(json.load(sys.stdin)['info']['version'])")
-          echo "Latest PyPI version: $VER"
-          echo "version=$VER" >> $GITHUB_OUTPUT
 
-      - id: check_release
-        name: Check if Release Exists
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FORCE: ${{ inputs.force_build }}
-        run: |
-          VER="${{ steps.pypi.outputs.version }}"
-          TAG="v$VER"
-          
-          if [ "$FORCE" == "true" ]; then
-            echo "Force build enabled."
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            echo "Release $TAG already exists. Skipping build."
-            echo "should_build=false" >> $GITHUB_OUTPUT
-          else
-            echo "Release $TAG not found. Starting build."
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          fi
+      - name: Install ci_tool
+        run: pip install -e ./ci_tool
+
+      - id: discover
+        name: Discover currently-served Termux python version
+        run: |
+          python -m ci_tool discover-python-version \
+            --abi arm64-v8a \
+            --github-output "$GITHUB_OUTPUT"
+
+      - run: echo "Building against Termux python ${{ steps.discover.outputs.python_version }}"
 
   build:
-    name: Build ${{ matrix.arch }} (Py${{ matrix.python-version }})
-    needs: check-version
-    if: needs.check-version.outputs.should_build == 'true'
+    needs: discover
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
-        arch: ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64']
+        android_abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Rust & Targets
+      - name: Checkout pydantic-core
+        uses: actions/checkout@v4
+        with:
+          repository: pydantic/pydantic-core
+          ref: ${{ inputs.pydantic_core_ref || 'main' }}
+          path: pydantic-core
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ci_tool
+        run: pip install -e ./ci_tool
+
+      - name: Install Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-linux-android
+            armv7-linux-androideabi
+            x86_64-linux-android
+            i686-linux-android
+
+      - name: Install maturin + binutils + patchelf
         run: |
           pip install maturin
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source "$HOME/.cargo/env"
-          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+          sudo apt-get update
+          sudo apt-get install -y patchelf binutils
 
-      - name: Cache Cargo Registry
-        uses: actions/cache@v4
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
         with:
+          ndk-version: r26d
+
+      - name: Build + patch + retag wheel
+        run: |
+          python -m ci_tool build \
+            --abi ${{ matrix.android_abi }} \
+            --python-version ${{ needs.discover.outputs.python_version }} \
+            --android-api-level ${{ env.ANDROID_API_LEVEL }} \
+            --ndk-home ${{ steps.ndk.outputs.ndk-path }} \
+            --manifest-path pydantic-core/Cargo.toml \
+            --out-dir dist \
+            --cache-dir .ci-cache \
+            --github-output "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.android_abi }}-py${{ needs.discover.outputs.python_version }}
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+            dist/*.whl
+            dist/*.whl.json
 
-      - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK r25b
-        run: |
-          yes | sdkmanager "ndk;${{ env.NDK_VERSION }}" > /dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
-
-      - name: Build Wheel (Termux Fix)
-        id: build_step
-        run: |
-          set -e
-          source "$HOME/.cargo/env"
-
-          # --- Environment Configuration ---
-          PY_VER="${{ matrix.python-version }}"
-          PKG_VER="${{ needs.check-version.outputs.version }}"
-          ARCH="${{ matrix.arch }}"
-          export ANDROID_API_LEVEL=${{ env.ANDROID_API }}
-          
-          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-          export PATH="$NDK_BIN:$PATH"
-
-          # --- Architecture Config ---
-          if [ "$ARCH" == "arm64-v8a" ]; then
-             RUST_TARGET="aarch64-linux-android"
-             CC_TARGET="aarch64-linux-android${ANDROID_API}"
-             NDK_LIB_ARCH="aarch64-linux-android"
-             PLAT_TAG="linux_aarch64"
-          elif [ "$ARCH" == "armeabi-v7a" ]; then
-             RUST_TARGET="armv7-linux-androideabi"
-             CC_TARGET="armv7a-linux-androideabi${ANDROID_API}"
-             NDK_LIB_ARCH="arm-linux-androideabi"
-             PLAT_TAG="linux_armv7l"
-          elif [ "$ARCH" == "x86" ]; then
-             RUST_TARGET="i686-linux-android"
-             CC_TARGET="i686-linux-android${ANDROID_API}"
-             NDK_LIB_ARCH="i686-linux-android"
-             PLAT_TAG="linux_i686"
-          elif [ "$ARCH" == "x86_64" ]; then
-             RUST_TARGET="x86_64-linux-android"
-             CC_TARGET="x86_64-linux-android${ANDROID_API}"
-             NDK_LIB_ARCH="x86_64-linux-android"
-             PLAT_TAG="linux_x86_64"
-          fi
-          
-          # --- Configure Linker ---
-          CLANG_WRAPPER="${CC_TARGET}-clang"
-          LINKER_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
-          if [ -f "$NDK_BIN/$CLANG_WRAPPER" ]; then
-             export $LINKER_VAR="$NDK_BIN/$CLANG_WRAPPER"
-          else
-             export $LINKER_VAR="$NDK_BIN/clang"
-          fi
-
-          # --- Mocking Python (Termux Strategy) ---
-          MOCK_DIR="$(pwd)/mock_libs"
-          mkdir -p "$MOCK_DIR"
-
-          # 1. Create fake libpython with SONAME
-          "$NDK_BIN/clang" --target=$CC_TARGET -shared \
-            -Wl,-soname,libpython$PY_VER.so \
-            -o "$MOCK_DIR/libpython$PY_VER.so" -xc /dev/null
-
-          # 2. Copy real libdl.so
-          LIBDL_PATH=$(find "$NDK_SYSROOT" -name "libdl.so" | grep "$NDK_LIB_ARCH" | head -n 1)
-          cp "$LIBDL_PATH" "$MOCK_DIR/"
-          
-          # 3. Create Sysconfig File (BUT DO NOT EXPORT VAR YET)
-          SYSCONFIG_NAME="_sysconfigdata__linux_${RUST_TARGET}"
-          cat > "$MOCK_DIR/${SYSCONFIG_NAME}.py" <<EOF
-          build_time_vars = {
-              'abiflags': '',
-              'ABIFLAGS': '',
-              'SO': '.so', 'SOABI': 'cpython-$PY_VER', 'EXT_SUFFIX': '.so',
-              'LIBDIR': '$MOCK_DIR', 
-              'LDLIBRARY': 'libpython$PY_VER.so',
-              'Py_ENABLE_SHARED': 1, 
-              'CC': 'clang', 'CXX': 'clang++',
-              'VERSION': '$PY_VER', 'LDSHARED': 'clang -shared',
-              'LDFLAGS': '-L$MOCK_DIR', 'CCSHARED': '-fPIC', 'GNULD': 'yes',
-              'Py_DEBUG': 0, 'WITH_PYMALLOC': 1,
-          }
-          EOF
-
-          # --- Download Source Code (CLEAN ENVIRONMENT) ---
-          # Run pip BEFORE exporting cross-compilation env vars
-          mkdir -p build_src && cd build_src
-          echo "Downloading source for $PKG_VER..."
-          pip download "${{ env.PACKAGE_NAME }}==$PKG_VER" --no-binary :all: --no-deps
-          tar -xzf pydantic?core-*.tar.gz
-          cd pydantic?core-*/
-
-          # --- APPLY CROSS-COMPILATION ENV VARS NOW ---
-          export PYO3_CROSS_LIB_DIR="$MOCK_DIR"
-          export PYTHONPATH="$MOCK_DIR:$PYTHONPATH"
-          export PYO3_CROSS_PYTHON_VERSION="$PY_VER"
-          export _PYTHON_SYSCONFIGDATA_NAME="$SYSCONFIG_NAME"
-          
-          # --- Rust Flags ---
-          # 1. --no-as-needed: Forces recording of libpython dependency
-          # 2. -rpath: Hardcodes Termux library path
-          RUSTFLAGS_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_RUSTFLAGS"
-          export $RUSTFLAGS_VAR="\
-          -L native=$MOCK_DIR \
-          -C link-arg=--target=$CC_TARGET \
-          -C link-arg=-Wl,--no-as-needed \
-          -C link-arg=-lpython$PY_VER \
-          -C link-arg=-Wl,--as-needed \
-          -C link-arg=-Wl,--unresolved-symbols=ignore-all \
-          -C link-arg=-Wl,-rpath=/data/data/com.termux/files/usr/lib"
-
-          echo "Starting Maturin Build..."
-          maturin build --release --strip --target "$RUST_TARGET" --interpreter python$PY_VER --skip-auditwheel
-
-          # --- Rename Output ---
-          cd target/wheels
-          OLD=$(ls *.whl)
-          NEW=$(echo "$OLD" | sed -E "s/(-[^-]+)\.whl$/-${PLAT_TAG}.whl/")
-          mv "$OLD" "$NEW"
-          
-          echo "WHEEL_PATH=$(pwd)/$NEW" >> $GITHUB_OUTPUT
-
-      - name: Upload Temporary Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-${{ matrix.python-version }}-${{ matrix.arch }}
-          path: ${{ steps.build_step.outputs.WHEEL_PATH }}
-          retention-days: 1
-
-  release:
-    name: Create GitHub Release
-    needs: [check-version, build]
-    if: needs.check-version.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  smoke-test:
+    needs: [discover, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners only — no qemu/binfmt needed. Confirmed by
+          # termux-docker's own docker_build.yml, which runs its `arm`
+          # (32-bit) build on ubuntu-24.04-arm and its `i686` build on
+          # plain ubuntu-24.04, with no --privileged / aptman-qus step.
+          - android_abi: arm64-v8a
+            runner: ubuntu-24.04-arm
+          - android_abi: armeabi-v7a
+            runner: ubuntu-24.04-arm
+          - android_abi: x86_64
+            runner: ubuntu-24.04
+          - android_abi: x86
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          path: wheels
+          python-version: "3.12"
+
+      - name: Install ci_tool
+        run: pip install -e ./ci_tool
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-${{ matrix.android_abi }}-*
+          path: dist
           merge-multiple: true
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Smoke test against real termux-docker
+        run: |
+          python -m ci_tool smoke-test \
+            --abi ${{ matrix.android_abi }} \
+            --wheel-dir dist
+
+  release-notes:
+    needs: [discover, build, smoke-test]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          tag_name: v${{ needs.check-version.outputs.version }}
-          name: ${{ env.PACKAGE_NAME }} v${{ needs.check-version.outputs.version }}
-          body: |
-            ### Automated Android Build 🤖
-            
-            **Package:** `${{ env.PACKAGE_NAME }}`
-            **Version:** `${{ needs.check-version.outputs.version }}`
-            
-            **Platform Support:**
-            - **OS:** Android (Termux)
-            - **Archs:** `aarch64`, `armv7`, `x86`, `x86_64`
-            - **Python:** 3.9 - 3.13
-            
-            **Installation:**
-            ```bash
-            pip install pydantic_core-*.whl
-            ```
-            
-            **Technical Details:**
-            - Built with NDK r25b (API 24)
-            - Includes `RPATH` fix for Termux library location
-            - Linked with `--no-as-needed` to ensure `libpython` loading
-          files: wheels/*.whl
-          make_latest: true
+          path: dist
+          merge-multiple: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ./ci_tool
+      - name: Render release notes
+        run: |
+          python -m ci_tool release-notes \
+            --dist-dir dist \
+            --pydantic-core-version "${{ github.event.release.tag_name }}" \
+            --ndk-version "${{ env.NDK_VERSION }}" \
+            --android-api-level ${{ env.ANDROID_API_LEVEL }} \
+            --maturin-version "$(pip index versions maturin 2>/dev/null | head -1 || echo unknown)" \
+            --output release_body.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_body.md
+          files: dist/**/*.whl
