@@ -1,0 +1,52 @@
+name: Update PyPI Index
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published, edited, released, deleted]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  PACKAGE_NAME: pydantic-core
+
+jobs:
+  build-index:
+    name: Generate PEP 503 Index
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ci_tool
+        run: pip install -e ./ci_tool
+
+      - name: Generate static index
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -m ci_tool generate-index \
+            --repo ${{ github.repository }} \
+            --package-name ${{ env.PACKAGE_NAME }} \
+            --site-dir site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build-index
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
