@@ -4,20 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       pydantic_core_ref:
-        description: "pydantic-core git ref (tag/branch/sha) to build"
+        description: >-
+          Git ref to build, resolved against pydantic/pydantic (the
+          monorepo pydantic-core now lives in). Can be "main", a branch,
+          or a commit SHA. check_upstream.yml always passes an exact
+          commit SHA here.
         required: true
         default: "main"
-      dry_run:
+      release_version:
         description: >-
-          Build and smoke-test only; never publish a GitHub Release
-          even if pydantic_core_ref looks like a version tag.
+          Exact pydantic-core version this ref corresponds to. Set
+          automatically by check_upstream.yml. Leave empty for an ad hoc
+          build — a release is only published when this resolves to a
+          non-empty value (either from this input directly, or parsed
+          from pydantic_core_ref if it happens to look like a version).
+        required: false
+        default: ""
+      dry_run:
+        description: "Build and smoke-test only; never publish a GitHub Release."
         required: false
         default: false
         type: boolean
 
 permissions:
   contents: write
-  actions: write  # required for `gh workflow run update_index.yml` below
+  actions: write
 
 env:
   ANDROID_API_LEVEL: 24
@@ -28,11 +39,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       python_version: ${{ steps.discover.outputs.python_version }}
-      # Non-empty only when pydantic_core_ref looks like a real version
-      # tag (e.g. "v2.49.0") — see ci_tool.upstream.version_from_ref.
-      # Deliberately NOT a second manually-typed input: a free-text
-      # field that has to be kept in sync with pydantic_core_ref is
-      # exactly the kind of thing that's easy to forget to fill in.
       release_version: ${{ steps.resolve_ref.outputs.release_version }}
     steps:
       - uses: actions/checkout@v4
@@ -52,10 +58,11 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - id: resolve_ref
-        name: Check whether pydantic_core_ref is a releasable version tag
+        name: Resolve the release version for this build, if any
         run: |
           python -m ci_tool resolve-ref \
             --ref "${{ inputs.pydantic_core_ref }}" \
+            --version "${{ inputs.release_version }}" \
             --github-output "$GITHUB_OUTPUT"
 
       - run: echo "Building against Termux python ${{ steps.discover.outputs.python_version }}"
@@ -70,12 +77,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout pydantic-core
+      - name: Checkout pydantic (monorepo containing pydantic-core)
         uses: actions/checkout@v4
         with:
-          repository: pydantic/pydantic-core
+          repository: pydantic/pydantic
           ref: ${{ inputs.pydantic_core_ref }}
-          path: pydantic-core
+          path: pydantic-monorepo
 
       - uses: actions/setup-python@v5
         with:
@@ -112,7 +119,7 @@ jobs:
             --python-version ${{ needs.discover.outputs.python_version }} \
             --android-api-level ${{ env.ANDROID_API_LEVEL }} \
             --ndk-home ${{ steps.ndk.outputs.ndk-path }} \
-            --manifest-path pydantic-core/Cargo.toml \
+            --manifest-path pydantic-monorepo/pydantic-core/Cargo.toml \
             --out-dir dist \
             --cache-dir .ci-cache \
             --github-output "$GITHUB_OUTPUT"
@@ -130,10 +137,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Native runners only — no qemu/binfmt needed. Confirmed by
-          # termux-docker's own docker_build.yml, which runs its `arm`
-          # (32-bit) build on ubuntu-24.04-arm and its `i686` build on
-          # plain ubuntu-24.04, with no --privileged / aptman-qus step.
           - android_abi: arm64-v8a
             runner: ubuntu-24.04-arm
           - android_abi: armeabi-v7a
@@ -197,11 +200,6 @@ jobs:
           files: dist/**/*.whl
 
       - name: Trigger PyPI index rebuild
-        # A release created here via the default GITHUB_TOKEN does not
-        # itself fire update_index.yml's `release: published` trigger —
-        # GitHub suppresses recursive triggering from GITHUB_TOKEN for
-        # every event type except workflow_dispatch/repository_dispatch
-        # — so it's dispatched explicitly instead of relying on that.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run update_index.yml --ref ${{ github.ref_name }}
