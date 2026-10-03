@@ -150,15 +150,21 @@ def _generate_index(args: argparse.Namespace) -> None:
 
 def _check_upstream(args: argparse.Namespace) -> None:
     result = check_for_update(args.repo, args.package_name, upstream_repo=args.upstream_repo)
-    print(f"package_version={result.package_version}")
-    print(f"upstream_ref={result.upstream_ref}")
+    if result.package_version is None:
+        print(
+            f"No stable {args.package_name} version on PyPI has a matching "
+            f"tag in {args.upstream_repo} yet; nothing to build."
+        )
+    else:
+        print(f"package_version={result.package_version}")
+        print(f"upstream_ref={result.upstream_ref}")
     print(f"should_build={str(result.should_build).lower()}")
     if args.github_output:
         with open(args.github_output, "a") as f:
             f.write(f"should_build={str(result.should_build).lower()}\n")
-            f.write(f"package_version={result.package_version}\n")
-            f.write(f"release_tag={result.release_tag}\n")
-            f.write(f"upstream_ref={result.upstream_ref}\n")
+            f.write(f"package_version={result.package_version or ''}\n")
+            f.write(f"release_tag={result.release_tag or ''}\n")
+            f.write(f"upstream_ref={result.upstream_ref or ''}\n")
 
 
 def _resolve_ref(args: argparse.Namespace) -> None:
