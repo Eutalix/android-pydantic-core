@@ -39,11 +39,6 @@ UPSTREAM_REPO_DEFAULT = "pydantic/pydantic"
 # Confirmed via `gh api repos/pydantic/pydantic/git/trees/main?recursive=1`.
 UPSTREAM_CARGO_TOML_PATH_DEFAULT = "pydantic-core/Cargo.toml"
 
-# Matches a (possibly "v"-prefixed) version number anywhere a manually
-# supplied ref might end with one, e.g. "v2.49.0" or "pydantic-core-v2.49.0".
-# Not used to resolve the *automated* flow's ref (that's always a raw
-# commit SHA, which never looks like this) — only as a convenience for a
-# human manually dispatching the workflow against a literal version tag.
 _VERSION_SUFFIX_RE = re.compile(r"v?(\d+\.\d+\.\d+(?:[A-Za-z0-9.+-]*)?)$")
 
 _PACKAGE_SECTION_RE = re.compile(r"(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)")
@@ -101,12 +96,10 @@ def extract_cargo_version(cargo_toml_text: str) -> str | None:
 
     Deliberately scoped to the [package] section only (not a bare
     "^version = ..." search over the whole file): Cargo.toml also
-    contains dependency version pins (e.g. `regex = "1.12.3"`) and
-    inline tables with their own "version" keys (e.g.
-    `pyo3 = { version = "0.29.2", ... }`), though none of those happen
-    to collide with a line-anchored "version = ..." pattern in the real
-    file at time of writing — scoping to [package] makes that
-    non-collision a guarantee rather than a coincidence.
+    contains dependency version pins and inline tables with their own
+    "version" keys (e.g. `pyo3 = { version = "0.29.2", ... }`) — scoping
+    to [package] makes non-collision with those a guarantee rather than
+    a coincidence of the current file layout.
     """
     section_match = _PACKAGE_SECTION_RE.search(cargo_toml_text)
     search_space = section_match.group(1) if section_match else cargo_toml_text
@@ -120,14 +113,23 @@ def iter_path_commits(
     """Yields commits touching `path` in `upstream_repo`, newest first,
     fetched one page at a time so resolve_commit_for_version() can stop
     as soon as it finds a match instead of always paying for the file's
-    entire commit history (which, for a long-lived file like Cargo.toml,
-    can be hundreds of commits)."""
+    entire commit history.
+
+    Explicitly passes --method GET: `gh api` silently switches its
+    default HTTP method to POST whenever -f/--field parameters are
+    given, unless a method is specified — which made this call 404
+    against a GET-only endpoint in production, since "path"/"per_page"/
+    "page" were being sent as a POST body against a route that doesn't
+    accept POST at all.
+    """
     for page in range(1, max_pages + 1):
         result = subprocess.run(
             [
                 "gh",
                 "api",
                 f"repos/{upstream_repo}/commits",
+                "--method",
+                "GET",
                 "-f",
                 f"path={path}",
                 "-f",
@@ -151,8 +153,10 @@ def iter_path_commits(
 
 
 def fetch_file_at_commit(upstream_repo: str, path: str, ref: str) -> str:
+    """See iter_path_commits()'s docstring for why --method GET is
+    required here too."""
     result = subprocess.run(
-        ["gh", "api", f"repos/{upstream_repo}/contents/{path}", "-f", f"ref={ref}"],
+        ["gh", "api", f"repos/{upstream_repo}/contents/{path}", "--method", "GET", "-f", f"ref={ref}"],
         capture_output=True,
         text=True,
     )
@@ -168,8 +172,7 @@ def resolve_commit_for_version(upstream_repo: str, cargo_toml_path: str, version
     """The exact upstream commit SHA at which pydantic-core/Cargo.toml's
     `[package] version` reads `version` — or None if no commit touching
     that file ever set it to exactly that value (within the pages
-    scanned). This is a real, checkout-able git ref, unlike a tag name
-    that may not exist."""
+    scanned)."""
     for commit in iter_path_commits(upstream_repo, cargo_toml_path):
         sha = commit.get("sha")
         if not sha:
@@ -185,12 +188,10 @@ def resolve_commit_for_version(upstream_repo: str, cargo_toml_path: str, version
 
 def version_from_ref(ref: str) -> str | None:
     """Convenience for a human manually dispatching the workflow with a
-    literal version-looking ref (e.g. "v2.49.0"). Returns None for
-    anything that doesn't end in a version number — in particular, for
-    the raw commit SHAs the automated check_upstream.yml flow passes,
-    which is why that flow passes the version explicitly instead of
-    relying on this function (see build_wheels.yml's `release_version`
-    input)."""
+    literal version-looking ref (e.g. "v2.49.0"). Returns None for a raw
+    commit SHA, which is why the automated flow passes the version
+    explicitly instead (see build_wheels.yml's `release_version` input).
+    """
     match = _VERSION_SUFFIX_RE.search(ref.strip())
     return match.group(1) if match else None
 
@@ -207,7 +208,7 @@ def release_exists(repo: str, tag: str) -> bool:
 
 @dataclass(frozen=True)
 class UpdateCheck:
-    package_version: str | None  # None => nothing wheel-complete on PyPI has a matching upstream commit
+    package_version: str | None
     release_tag: str | None
     upstream_ref: str | None  # a commit SHA, not a tag
     already_released: bool
@@ -225,13 +226,7 @@ def check_for_update(
 ) -> UpdateCheck:
     """Walks PyPI's wheel-complete stable versions newest-first and
     returns the first one for which pydantic-core/Cargo.toml's own
-    commit history actually has a matching `version = "..."` — rather
-    than trusting PyPI's `info.version` pointer (which can reference an
-    incomplete release) or guessing a tag/release naming convention
-    (which broke twice already: the dedicated repo's tags stopped at
-    v2.41.5, and the monorepo has no pydantic-core-specific tags or
-    release-name convention at all).
-    """
+    commit history actually has a matching `version = "..."`."""
     for version in list_stable_pypi_versions(package_name):
         upstream_ref = resolve_commit_for_version(upstream_repo, cargo_toml_path, version)
         if upstream_ref is None:

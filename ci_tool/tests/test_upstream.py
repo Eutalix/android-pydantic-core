@@ -1,3 +1,5 @@
+import base64
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -7,6 +9,8 @@ from ci_tool.upstream import (
     UPSTREAM_REPO_DEFAULT,
     check_for_update,
     extract_cargo_version,
+    fetch_file_at_commit,
+    iter_path_commits,
     list_stable_pypi_versions,
     release_tag_for_version,
     resolve_commit_for_version,
@@ -93,6 +97,33 @@ def test_list_stable_pypi_versions_requires_a_real_wheel_file():
     # (e.g. "2.9.0" > "2.41.5" as plain strings) by using real
     # semantic-version comparison.
     assert versions == ["2.41.5", "2.40.0"]
+
+
+def test_iter_path_commits_uses_explicit_get_method():
+    # Regression test: `gh api` silently switches its default HTTP
+    # method from GET to POST whenever -f/--field parameters are given,
+    # unless --method is specified explicitly. This caused a real 404 in
+    # production against repos/{repo}/commits (a GET-only endpoint),
+    # since path/per_page/page ended up being sent as a POST body
+    # instead of query parameters.
+    fake_result = MagicMock(returncode=0, stdout="[]", stderr="")
+    with patch("ci_tool.upstream.subprocess.run", return_value=fake_result) as mock_run:
+        list(iter_path_commits("pydantic/pydantic", "pydantic-core/Cargo.toml"))
+
+    args = mock_run.call_args[0][0]
+    assert "--method" in args
+    assert args[args.index("--method") + 1] == "GET"
+
+
+def test_fetch_file_at_commit_uses_explicit_get_method():
+    payload = json.dumps({"content": base64.b64encode(b"hello").decode()})
+    fake_result = MagicMock(returncode=0, stdout=payload, stderr="")
+    with patch("ci_tool.upstream.subprocess.run", return_value=fake_result) as mock_run:
+        fetch_file_at_commit("pydantic/pydantic", "pydantic-core/Cargo.toml", "abc123")
+
+    args = mock_run.call_args[0][0]
+    assert "--method" in args
+    assert args[args.index("--method") + 1] == "GET"
 
 
 def test_resolve_commit_for_version_walks_history_until_match():
