@@ -1,0 +1,49 @@
+# git-cliff configuration — generates CHANGELOG.md from Conventional Commits.
+#
+# This changelog tracks changes to *this repository's tooling* (the CI
+# pipeline, the ci_tool package, install_pydantic_core.sh). It intentionally
+# does NOT track which pydantic-core version was packaged in each release —
+# that's the job of the per-release GitHub Release notes (see
+# ci_tool/release_notes.py), which link to pydantic's own changelog instead
+# of duplicating it.
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to the Android pydantic-core build pipeline itself.
+For which upstream pydantic-core version shipped in a given wheel drop,
+see the corresponding GitHub Release instead.
+"""
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }} ([{{ commit.id | truncate(length=7, end="") }}])
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "v[0-9]*"
+sort_commits = "oldest"
+commit_parsers = [
+    { message = "^feat", group = "Features" },
+    { message = "^fix", group = "Bug Fixes" },
+    { message = "^ci", group = "CI / Build Pipeline" },
+    { message = "^docs", group = "Documentation" },
+    { message = "^refactor", group = "Refactoring" },
+    { message = "^chore\\(release\\)", skip = true },
+    { message = "^chore", group = "Miscellaneous" },
+]

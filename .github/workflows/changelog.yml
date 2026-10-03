@@ -1,0 +1,45 @@
+name: Update Changelog
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'CHANGELOG.md'
+
+permissions:
+  contents: write
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure CHANGELOG.md exists
+        # `--prepend` (used below) inserts at the top of an *existing*
+        # file; on the very first run there is none yet, which produced
+        # `stat: cannot statx 'CHANGELOG.md'` in CI. An empty file is
+        # enough — git-cliff's own [changelog].header in cliff.toml
+        # supplies the actual title text.
+        run: touch CHANGELOG.md
+
+      - name: Generate CHANGELOG.md
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: ci_tool/cliff.toml
+          args: --unreleased --prepend CHANGELOG.md
+        # NOTE: deliberately no `env: OUTPUT: CHANGELOG.md` here anymore.
+        # Setting OUTPUT makes the action also pass `-o CHANGELOG.md`,
+        # which combined with `--prepend CHANGELOG.md` (`-p`) made
+        # git-cliff fail with:
+        #   ArgumentError("'-o' and '-p' can only be used together if
+        #   they point to different files")
+        # `--prepend` alone is sufficient to write the file.
+
+      - name: Commit updated changelog
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git diff --quiet CHANGELOG.md || (git add CHANGELOG.md && git commit -m "docs: update changelog [skip ci]" && git push)
