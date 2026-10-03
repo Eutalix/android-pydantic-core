@@ -19,7 +19,12 @@ from .pypi_index import build_index
 from .release_notes import ReleaseContext, WheelBuildInfo, render
 from .sysconfigdata import write as write_sysconfigdata
 from .termux import fetch_libpython_for_arch
-from .upstream import UPSTREAM_REPO_DEFAULT, check_for_update, version_from_ref
+from .upstream import (
+    UPSTREAM_CARGO_TOML_PATH_DEFAULT,
+    UPSTREAM_REPO_DEFAULT,
+    check_for_update,
+    version_from_ref,
+)
 from .wheel_tags import android_abi_tag
 
 
@@ -60,9 +65,6 @@ def _build(args: argparse.Namespace) -> None:
     patch_extension_in_wheel(wheel_path)
     final_path = retag_wheel(wheel_path, cfg)
 
-    # Sidecar metadata lets later `smoke-test`/`release-notes` invocations
-    # (separate jobs, artifacts re-downloaded) reconstruct build info
-    # without re-deriving anything from the filename alone.
     meta_path = final_path.with_suffix(".whl.json")
     meta_path.write_text(
         json.dumps(
@@ -149,15 +151,21 @@ def _generate_index(args: argparse.Namespace) -> None:
 
 
 def _check_upstream(args: argparse.Namespace) -> None:
-    result = check_for_update(args.repo, args.package_name, upstream_repo=args.upstream_repo)
+    result = check_for_update(
+        args.repo,
+        args.package_name,
+        upstream_repo=args.upstream_repo,
+        cargo_toml_path=args.cargo_toml_path,
+    )
     if result.package_version is None:
         print(
-            f"No stable {args.package_name} version on PyPI has a matching "
-            f"tag in {args.upstream_repo} yet; nothing to build."
+            f"No stable, wheel-complete {args.package_name} version on PyPI has a "
+            f"matching commit in {args.upstream_repo}:{args.cargo_toml_path} yet; "
+            "nothing to build."
         )
     else:
         print(f"package_version={result.package_version}")
-        print(f"upstream_ref={result.upstream_ref}")
+        print(f"upstream_ref={result.upstream_ref}  (commit SHA, not a tag)")
     print(f"should_build={str(result.should_build).lower()}")
     if args.github_output:
         with open(args.github_output, "a") as f:
@@ -168,7 +176,13 @@ def _check_upstream(args: argparse.Namespace) -> None:
 
 
 def _resolve_ref(args: argparse.Namespace) -> None:
-    version = version_from_ref(args.ref) or ""
+    # An explicit --version always wins: the automated check_upstream.yml
+    # flow passes both the commit SHA and its exact version together
+    # (computed in the same place, so they can never drift). A bare ref
+    # with no --version (the plain manual-dispatch case) falls back to
+    # pattern-matching the ref itself, which only works for literal
+    # version-looking refs like "v2.49.0" — never for a raw commit SHA.
+    version = args.version or version_from_ref(args.ref) or ""
     print(f"release_version={version}")
     if args.github_output:
         with open(args.github_output, "a") as f:
@@ -220,19 +234,21 @@ def main(argv: list[str] | None = None) -> None:
 
     cu_p = sub.add_parser(
         "check-upstream",
-        help="Check PyPI for a pydantic-core version not yet released by this repo",
+        help="Find the newest pydantic-core version that's wheel-complete on PyPI and has a matching upstream commit",
     )
     cu_p.add_argument("--repo", required=True)
     cu_p.add_argument("--package-name", default="pydantic-core")
     cu_p.add_argument("--upstream-repo", default=UPSTREAM_REPO_DEFAULT)
+    cu_p.add_argument("--cargo-toml-path", default=UPSTREAM_CARGO_TOML_PATH_DEFAULT)
     cu_p.add_argument("--github-output", default=None)
     cu_p.set_defaults(func=_check_upstream)
 
     rr_p = sub.add_parser(
         "resolve-ref",
-        help="Derive a release version from a git ref, if it looks like one",
+        help="Derive the release version for a build: explicit --version wins, else parsed from --ref",
     )
     rr_p.add_argument("--ref", required=True)
+    rr_p.add_argument("--version", default=None)
     rr_p.add_argument("--github-output", default=None)
     rr_p.set_defaults(func=_resolve_ref)
 
