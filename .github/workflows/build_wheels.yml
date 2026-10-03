@@ -7,8 +7,18 @@ on:
         description: "pydantic-core git ref (tag/branch/sha) to build"
         required: true
         default: "main"
-  release:
-    types: [published]
+      release_version:
+        description: >-
+          If set, publish a GitHub Release tagged v<value> once all
+          wheels pass smoke testing. Leave empty for a scratch build
+          that only uploads workflow artifacts. Set automatically by
+          check_upstream.yml.
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: write  # required for `gh workflow run update_index.yml` below
 
 env:
   ANDROID_API_LEVEL: 24
@@ -145,7 +155,7 @@ jobs:
 
   release-notes:
     needs: [discover, build, smoke-test]
-    if: github.event_name == 'release'
+    if: inputs.release_version != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -157,16 +167,29 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ./ci_tool
+
       - name: Render release notes
         run: |
           python -m ci_tool release-notes \
             --dist-dir dist \
-            --pydantic-core-version "${{ github.event.release.tag_name }}" \
+            --pydantic-core-version "${{ inputs.release_version }}" \
             --ndk-version "${{ env.NDK_VERSION }}" \
             --android-api-level ${{ env.ANDROID_API_LEVEL }} \
             --maturin-version "$(pip index versions maturin 2>/dev/null | head -1 || echo unknown)" \
             --output release_body.md
+
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ inputs.release_version }}
           body_path: release_body.md
           files: dist/**/*.whl
+
+      - name: Trigger PyPI index rebuild
+        # A release created here via the default GITHUB_TOKEN does not
+        # itself fire update_index.yml's `release: published` trigger —
+        # GitHub suppresses recursive triggering from GITHUB_TOKEN for
+        # every event type except workflow_dispatch/repository_dispatch
+        # — so it's dispatched explicitly instead of relying on that.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run update_index.yml --ref ${{ github.ref_name }}
