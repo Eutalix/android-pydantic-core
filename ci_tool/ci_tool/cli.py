@@ -19,6 +19,7 @@ from .pypi_index import build_index
 from .release_notes import ReleaseContext, WheelBuildInfo, render
 from .sysconfigdata import write as write_sysconfigdata
 from .termux import fetch_libpython_for_arch
+from .upstream import check_for_update
 from .wheel_tags import android_abi_tag
 
 
@@ -147,6 +148,18 @@ def _generate_index(args: argparse.Namespace) -> None:
     print(f"indexed {count} wheel(s) for {args.package_name}")
 
 
+def _check_upstream(args: argparse.Namespace) -> None:
+    result = check_for_update(args.repo, args.package_name, ref_template=args.ref_template)
+    print(f"package_version={result.package_version}")
+    print(f"should_build={str(result.should_build).lower()}")
+    if args.github_output:
+        with open(args.github_output, "a") as f:
+            f.write(f"should_build={str(result.should_build).lower()}\n")
+            f.write(f"package_version={result.package_version}\n")
+            f.write(f"release_tag={result.release_tag}\n")
+            f.write(f"upstream_ref={result.upstream_ref}\n")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="ci_tool")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -189,6 +202,16 @@ def main(argv: list[str] | None = None) -> None:
     idx_p.add_argument("--package-name", default="pydantic-core")
     idx_p.add_argument("--site-dir", default="site")
     idx_p.set_defaults(func=_generate_index)
+
+    cu_p = sub.add_parser(
+        "check-upstream",
+        help="Check PyPI for a pydantic-core version not yet released by this repo",
+    )
+    cu_p.add_argument("--repo", required=True)
+    cu_p.add_argument("--package-name", default="pydantic-core")
+    cu_p.add_argument("--ref-template", default="v{version}")
+    cu_p.add_argument("--github-output", default=None)
+    cu_p.set_defaults(func=_check_upstream)
 
     args = parser.parse_args(argv)
     args.func(args)
