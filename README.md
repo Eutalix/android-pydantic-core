@@ -3,6 +3,19 @@
 [![Build & Release](https://img.shields.io/github/actions/workflow/status/Eutalix/android-pydantic-core/build_wheels.yml?label=Build)](https://github.com/Eutalix/android-pydantic-core/actions/build_wheels.yml)
 [![Architectures](https://img.shields.io/badge/arch-arm64--v8a%20%7C%20armeabi--v7a%20%7C%20x86%20%7C%20x86__64-orange)](https://github.com/Eutalix/android-pydantic-core/releases)
 
+> ⚠️ **Project Deprecated & Archived**
+>
+> This repository was originally created when the **TUR (Termux User Repository)** was lagging behind and serving an outdated `pydantic-core` package, making automated CI cross-compiled wheels necessary to support the community.
+>
+> **Things have since changed:** The official TUR ecosystem has been fixed, stabilized, and is now actively compiling and publishing the latest versions natively. 
+>
+> Because the project's primary mission has been fulfilled and my current engineering focus has shifted to other initiatives and personal priorities, **I no longer have the bandwidth to maintain this pipeline against the constant toolchain shifts and upstream instabilities**.
+>
+> * **What should you do?** We strongly recommend that all users migrate to the official, up-to-date packages directly from TUR.
+> * **Repository Status:** This repository is now archived. The codebase will remain read-only for historical reference and technical portfolio purposes. Thank you to everyone who downloaded, tested, and supported the project!
+
+---
+
 **Automated builds of `pydantic-core` for Android, tested against real Termux.**
 
 Compiling `pydantic-core` on-device requires a Rust toolchain and takes
